@@ -1,4 +1,5 @@
 mod frontiers;
+mod peer_map;
 pub use frontiers::Frontiers;
 
 use crate::{
@@ -160,7 +161,10 @@ impl VersionRange {
 /// can be created from cloning and modifying other similar version vectors.
 #[repr(transparent)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ImVersionVector(im::HashMap<PeerID, Counter, rustc_hash::FxBuildHasher>);
+pub struct ImVersionVector(peer_map::PeerMap<Counter>);
+
+/// An iterator over the entries of an [ImVersionVector], in an unspecified order.
+pub type ImVersionVectorIter<'a> = peer_map::Iter<'a, Counter>;
 
 #[inline]
 fn normalize_vv_counter(counter: Counter) -> Counter {
@@ -197,7 +201,7 @@ impl ImVersionVector {
         self.0.is_empty()
     }
 
-    pub fn iter(&self) -> im::hashmap::Iter<'_, PeerID, Counter> {
+    pub fn iter(&self) -> ImVersionVectorIter<'_> {
         self.0.iter()
     }
 

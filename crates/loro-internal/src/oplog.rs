@@ -211,7 +211,7 @@ impl OpLog {
     /// ops. Local ops are always visible (never behind the shallow root), so the
     /// visible count grows by exactly `delta`. This avoids a per-op full
     /// recompute via [`Self::calc_visible_op_count`], which iterates the version
-    /// vectors and heap-allocates an `im::HashMap` iterator on every call.
+    /// vectors on every call.
     #[inline]
     pub(crate) fn inc_visible_op_count(&self, delta: usize) {
         self.visible_op_count

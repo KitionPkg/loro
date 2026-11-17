@@ -1804,7 +1804,6 @@ dependencies = [
  "enum_dispatch",
  "generic-btree",
  "getrandom 0.2.16",
- "im",
  "itertools 0.12.1",
  "js-sys",
  "leb128",
@@ -1935,7 +1934,7 @@ checksum = "3f3d053a135388e6b1df14e8af1212af5064746e9b87a06a345a7a779ee9695a"
 
 [[package]]
 name = "loro-wasm"
-version = "1.16.3"
+version = "1.16.4"
 dependencies = [
  "js-sys",
  "loro-common 1.16.0",

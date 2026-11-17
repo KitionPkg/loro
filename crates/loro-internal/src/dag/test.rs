@@ -1,7 +1,7 @@
 #![allow(unused)]
 use arbitrary::Arbitrary;
-use im::HashSet;
 use loro_common::HasCounter;
+use rustc_hash::FxHashSet as HashSet;
 use std::{cmp::Ordering, sync::Arc};
 
 use super::*;

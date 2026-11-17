@@ -19,7 +19,7 @@ pub use loro_internal::pre_commit::{
 pub use loro_internal::sync;
 pub use loro_internal::undo::{OnPop, UndoItemMeta, UndoOrRedo};
 use loro_internal::version::shrink_frontiers;
-pub use loro_internal::version::ImVersionVector;
+pub use loro_internal::version::{ImVersionVector, ImVersionVectorIter};
 use loro_internal::DocState;
 use loro_internal::LoroDoc as InnerLoroDoc;
 use loro_internal::OpLog;
