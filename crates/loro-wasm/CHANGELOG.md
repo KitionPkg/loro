@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.19.0
+
+### Minor Changes
+
+- b6d455a: Add per-document memory budgets, memory statistics, explicit reclamation and `tryCommit()`, plus UndoManager byte limits. Bound caches and demote cold state while preserving exact hard-quota checks and atomic rollback of rejected imports. Reduce retained memory with compact internal layouts and page-cached state statistics. Native Rust supports file-backed history and state spilling, shared immutable spill files, checked reads and reportable storage errors; forks inherit independent memory policies.
+- 2c2d0f7: Add process-wide and WASM-instance-wide memory budgets, statistics and cross-document reclamation through `setGlobalMemoryBudget`, `getGlobalMemoryBudget`, `globalMemoryStats`, `reclaimGlobalMemory` and `tryReclaimGlobalToBudget`. Track WASM live heap and linear memory, report retained pages through `wasmLinearMemoryExceeded`, and check admission before large WASM input allocations. Incremental native accounting and reclamation backoff keep routine commits inexpensive.
+- 3e3eb6f: Improve snapshot and export speed, reduce peak import/export memory, and stream WASM `toJSON()` and large batch imports. Add `freeHistoryCache()`, `freeDiffCalculator()`, and `compactChangeStore()` for explicit cache reclamation.
+
+### Patch Changes
+
+- 0c627ec: Undo and redo text, list, map, counter, tree and movable-list edits from inverses recorded at commit, avoiding history-cache construction for supported steps. Preserve remote edits, checkpoint transforms and existing undo/redo behavior, and trim finite undo byte limits in one pass. Count recorded inverses, including the values they keep, toward `max_undo_bytes`, `undo_bytes` and the open transaction's `uncommitted_txn_bytes`.
+
 ## 1.18.0
 
 ### Minor Changes
