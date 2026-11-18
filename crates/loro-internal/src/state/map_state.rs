@@ -484,7 +484,7 @@ mod snapshot {
     use std::collections::BTreeMap;
 
     use loro_common::{InternalString, LoroValue};
-    use rustc_hash::{FxHashMap, FxHashSet};
+    use rustc_hash::FxHashMap;
     use serde_columnar::Itertools;
 
     use crate::{
@@ -552,8 +552,39 @@ mod snapshot {
             Self: Sized,
         {
             let value = value.into_map().unwrap();
+            let mut entries: Vec<(InternalString, LoroValue)> = value
+                .iter()
+                .map(|(key, value)| (key.as_str().into(), value.clone()))
+                .collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            MapState::decode_snapshot_entries(idx, entries, bytes)
+        }
+    }
+
+    impl MapState {
+        /// The state of a map whose value (`ordered`, from `decode_value_as_btree_map`) is
+        /// decoded already: the value's entries are moved into the state, in their order.
+        pub(crate) fn decode_snapshot_from_ordered(
+            idx: crate::container::idx::ContainerIdx,
+            ordered: BTreeMap<String, LoroValue>,
+            bytes: &[u8],
+        ) -> loro_common::LoroResult<Self> {
+            let entries = ordered
+                .into_iter()
+                .map(|(key, value)| (InternalString::from(key.as_str()), value))
+                .collect();
+            Self::decode_snapshot_entries(idx, entries, bytes)
+        }
+
+        /// The state of a map whose entries with a value are `entries`, sorted by key, and
+        /// whose deleted keys and the peer and lamport of every key are encoded in `bytes`.
+        fn decode_snapshot_entries(
+            idx: crate::container::idx::ContainerIdx,
+            entries: Vec<(InternalString, LoroValue)>,
+            bytes: &[u8],
+        ) -> loro_common::LoroResult<Self> {
             // keys_with_none_value
-            let (keys_with_none_value, mut bytes) =
+            let (mut keys_with_none_value, mut bytes) =
                 postcard::take_from_bytes::<Vec<InternalString>>(bytes).map_err(|_| {
                     loro_common::LoroError::DecodeError(
                         "Decode map keys_with_none_value failed"
@@ -561,18 +592,26 @@ mod snapshot {
                             .into_boxed_str(),
                     )
                 })?;
-            let keys_with_none_value: FxHashSet<_> = keys_with_none_value.into_iter().collect();
+            keys_with_none_value.sort_unstable();
+            keys_with_none_value.dedup();
 
             // peers
             let peers = decode_peer_table(&mut bytes, "Decode map state failed")?;
 
-            //
+            // Every key in order, merging the keys with a value and those without.
             let mut ans = MapState::new(idx);
-            let mut keys: Vec<_> = value.keys().map(|x| x.as_str().into()).collect();
-            keys.extend(keys_with_none_value.iter().cloned());
-            keys.sort_unstable();
-
-            for key in keys {
+            let mut values = entries.into_iter().peekable();
+            let mut deleted = keys_with_none_value.into_iter().peekable();
+            loop {
+                let (key, value) = match (values.peek(), deleted.peek()) {
+                    (None, None) => break,
+                    (Some((key, _)), Some(none)) if none < key => (deleted.next().unwrap(), None),
+                    (Some(_), _) => {
+                        let (key, value) = values.next().unwrap();
+                        (key, Some(value))
+                    }
+                    (None, Some(_)) => (deleted.next().unwrap(), None),
+                };
                 let peer_idx =
                     usize::try_from(read_state_leb_u64(&mut bytes, "Decode map state failed")?)
                         .map_err(|_| {
@@ -584,27 +623,7 @@ mod snapshot {
                             state_decode_error("Decode map state failed: lamport overflow")
                         })?;
                 let peer = decode_peer_from_table(&peers, peer_idx, "Decode map state failed")?;
-
-                if keys_with_none_value.contains(&key) {
-                    ans.insert(
-                        key,
-                        MapValue {
-                            value: None,
-                            lamp,
-                            peer,
-                        },
-                    );
-                } else {
-                    let value = value.get(&*key).unwrap();
-                    ans.insert(
-                        key,
-                        MapValue {
-                            value: Some(value.clone()),
-                            lamp,
-                            peer,
-                        },
-                    );
-                }
+                ans.insert(key, MapValue { value, lamp, peer });
             }
 
             if !bytes.is_empty() {
@@ -708,6 +727,57 @@ mod snapshot {
                     lamp: 1,
                     peer: 1,
                 }
+            );
+        }
+
+        /// A map's state built from its value decoded as an ordered map (the lazy read path)
+        /// equals the one built from its value, deleted keys and containers included.
+        #[test]
+        fn map_state_from_ordered_value_equals_state_from_value() {
+            use crate::event::Index;
+            use loro_common::{ContainerID, ContainerType};
+
+            let idx = ContainerIdx::from_index_and_type(0, loro_common::ContainerType::Map);
+            let child = ContainerID::new_normal(loro_common::ID::new(7, 3), ContainerType::Text);
+            let mut map = MapState::new(idx);
+            for (index, key) in ["e", "a", "d", "b", "c", "f"].into_iter().enumerate() {
+                let value = match key {
+                    "a" | "f" => None,
+                    "c" => Some(LoroValue::Container(child.clone())),
+                    _ => Some(LoroValue::I64(index as i64)),
+                };
+                map.insert(
+                    key.into(),
+                    MapValue {
+                        value,
+                        lamp: index as u32,
+                        peer: (index % 2) as u64,
+                    },
+                );
+            }
+            let mut bytes = Vec::new();
+            map.encode_snapshot_fast(&mut bytes);
+            let ctx = ContainerCreationContext {
+                configure: &Default::default(),
+                peer: 0,
+            };
+            let (value, rest) = MapState::decode_value(&bytes).unwrap();
+            let from_value = MapState::decode_snapshot_fast(idx, (value, rest), ctx).unwrap();
+            let (ordered, rest) = MapState::decode_value_as_btree_map(&bytes).unwrap();
+            let from_ordered = MapState::decode_snapshot_from_ordered(idx, ordered, rest).unwrap();
+            let entries = |state: &MapState| {
+                state
+                    .map
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(entries(&from_ordered), entries(&from_value));
+            assert_eq!(entries(&from_ordered).len(), 6);
+            assert_eq!(from_ordered.size, from_value.size);
+            assert_eq!(
+                from_ordered.get_child_index(&child),
+                Some(Index::Key("c".into()))
             );
         }
 

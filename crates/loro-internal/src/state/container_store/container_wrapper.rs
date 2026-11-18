@@ -765,12 +765,21 @@ impl ContainerWrapper {
             return Ok(());
         }
 
-        let ContainerData::Lazy(lazy) = &self.data else {
+        let ContainerData::Lazy(lazy) = &mut self.data else {
             unreachable!();
         };
         let bytes = lazy.bytes.as_ref().unwrap();
         let offset = lazy.bytes_offset_for_state.unwrap();
         let b = &bytes[offset..];
+        if let Some(LazyDecodedValue::Map { .. }) = &lazy.value {
+            // The state takes the decoded entries over, instead of a copy of them.
+            let Some(LazyDecodedValue::Map { ordered, .. }) = lazy.value.take() else {
+                unreachable!();
+            };
+            let state = MapState::decode_snapshot_from_ordered(idx, ordered, b)?;
+            self.data = ContainerData::State(state.into());
+            return Ok(());
+        }
         let v = lazy.value.as_ref().unwrap().to_loro_value();
         let state: State = match self.kind {
             ContainerType::Text => RichtextState::decode_snapshot_fast(idx, (v, b), ctx)?.into(),
