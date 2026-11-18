@@ -166,10 +166,25 @@ fn create_handler(inner: &BasicHandler, id: ContainerID) -> Handler {
     Handler::new_attached(id, inner.doc.clone())
 }
 
+/// A value read from `inner`'s state, a child container as its handler.
+///
+/// A normal container in a container's value was created there by an op of that container, so
+/// `inner` is its parent. A document loaded from a snapshot links children to their parents
+/// lazily, through a lookup in the state store; linking the child now spares that lookup when
+/// the child is edited or checked for deletion (one per child of a large edit).
 fn value_to_value_or_handler(inner: &BasicHandler, value: LoroValue) -> ValueOrHandler {
     match value {
         LoroValue::Container(container_id) => {
-            ValueOrHandler::Handler(create_handler(inner, container_id))
+            let normal = matches!(container_id, ContainerID::Normal { .. });
+            let handler = create_handler(inner, container_id);
+            if normal {
+                let arena = &inner.doc.arena;
+                let child = handler.container_idx();
+                if arena.get_registered_parent(child).is_none() {
+                    arena.set_parent(child, Some(inner.container_idx));
+                }
+            }
+            ValueOrHandler::Handler(handler)
         }
         value => ValueOrHandler::Value(value),
     }
@@ -5154,6 +5169,72 @@ mod test {
     use crate::{fx_map, ToJson};
     use loro_common::{ContainerID, ContainerType, LoroError, LoroValue, ID};
     use serde_json::json;
+
+    /// A child container read from its parent's value, in a document loaded lazily from a
+    /// snapshot, is linked to that parent: editing it needs no lookup of its parent in the state
+    /// store.
+    #[test]
+    fn a_child_read_from_its_parent_is_linked_to_it() {
+        let doc = LoroDoc::new_auto_commit();
+        let objects = doc.get_map("objects");
+        for index in 0..2_000 {
+            let object = objects
+                .insert_container(&format!("o{index}"), MapHandler::new_detached())
+                .unwrap();
+            object
+                .insert_container("cells", MapHandler::new_detached())
+                .unwrap()
+                .insert("x", index)
+                .unwrap();
+            doc.commit_then_renew();
+        }
+        let loaded = LoroDoc::new_auto_commit();
+        loaded
+            .import(&doc.export(ExportMode::Snapshot).unwrap())
+            .unwrap();
+        let cells_id = doc
+            .get_map("objects")
+            .get_("o1500")
+            .and_then(|object| object.into_handler().ok())
+            .and_then(|object| object.as_map().cloned())
+            .and_then(|object| object.get_("cells"))
+            .and_then(|cells| cells.into_handler().ok())
+            .map(|cells| cells.id())
+            .unwrap();
+        let unlinked = loaded
+            .arena
+            .id_to_idx(&cells_id)
+            .is_none_or(|idx| loaded.arena.get_registered_parent(idx).is_none());
+        assert!(unlinked, "the loaded document links its children lazily");
+
+        let objects = loaded.get_map("objects");
+        let Some(ValueOrHandler::Handler(Handler::Map(object))) = objects.get_("o1500") else {
+            panic!("an object")
+        };
+        let Some(ValueOrHandler::Handler(Handler::Map(cells))) = object.get_("cells") else {
+            panic!("its cells")
+        };
+        let arena = &loaded.arena;
+        assert_eq!(
+            arena.get_registered_parent(object.idx()),
+            Some(Some(objects.idx()))
+        );
+        assert_eq!(
+            arena.get_registered_parent(cells.idx()),
+            Some(Some(object.idx()))
+        );
+        cells.delete("x").unwrap();
+        cells.insert("y", 2).unwrap();
+        loaded.commit_then_renew();
+        assert_eq!(
+            loaded
+                .get_map("objects")
+                .get_deep_value()
+                .to_json_value()
+                .get("o1500"),
+            Some(&json!({ "cells": { "y": 2 } }))
+        );
+    }
 
     fn recheck_fast_blob(mut bytes: Vec<u8>) -> Vec<u8> {
         let checksum = xxhash_rust::xxh32::xxh32(&bytes[20..], u32::from_le_bytes(*b"LORO"));
