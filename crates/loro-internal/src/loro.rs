@@ -2898,6 +2898,13 @@ impl LoroDoc {
         self.oplog.lock().free_history_cache();
     }
 
+    /// Free the history cache, and the parsed form of the history the document read from bytes
+    /// (an imported snapshot's): a checkout across a long history, such as an undo of an old
+    /// change, parses all of it and keeps it parsed. Later checkouts parse what they read again.
+    pub fn release_parsed_history(&self) {
+        self.oplog.lock().release_parsed_history();
+    }
+
     /// Free the cached diff calculator that is used for checkout.
     pub fn free_diff_calculator(&self) {
         *self.diff_calculator.lock() = DiffCalculator::new(true);

@@ -351,6 +351,21 @@ impl DiffCalculator {
                 .map(|(x, (depth, _))| (*depth, *x))
                 .collect()
         };
+        // The maps whose diffs read the checkout index are indexed in one scan of the history.
+        let indexed: Vec<ContainerIdx> = all
+            .iter()
+            .map(|(_, idx)| *idx)
+            .filter(|idx| {
+                matches!(
+                    self.calculators.get(idx),
+                    Some((_, ContainerDiffCalculator::Map(map)))
+                        if matches!(map.current_mode, DiffMode::Checkout | DiffMode::Import)
+                )
+            })
+            .collect();
+        if !indexed.is_empty() {
+            oplog.with_history_cache(|h| h.ensure_maps_indexed(indexed));
+        }
         let mut ans = FxHashMap::default();
         let info = DiffCalcVersionInfo {
             from_vv: before,
@@ -565,8 +580,14 @@ fn replay_container_ops_from_empty(
     let empty_vv = VersionVector::default();
     let empty_frontiers = Frontiers::default();
     let target_frontiers = oplog.dag.vv_to_frontiers(vv);
-    let (_, iter) =
-        oplog.iter_from_replay_base_causally(&empty_vv, &empty_frontiers, vv, &target_frontiers);
+    // The whole history is read once: none of it is kept parsed.
+    let (_, iter) = oplog.iter_from_replay_base_causally_with(
+        &empty_vv,
+        &empty_frontiers,
+        vv,
+        &target_frontiers,
+        false,
+    );
 
     for (change, (start_counter, end_counter), vv) in iter {
         let iter_start = change
@@ -677,6 +698,7 @@ impl DiffCalculatorTrait for MapDiffCalculator {
     ) -> (InternalDiff, DiffMode) {
         match self.current_mode {
             DiffMode::Checkout | DiffMode::Import => oplog.with_history_cache(|h| {
+                h.ensure_maps_indexed([self.container_idx]);
                 h.ensure_shallow_map_seeded(self.container_idx);
                 let checkout_index = &h.get_checkout_index().map;
                 let keys = std::mem::take(&mut self.changed);

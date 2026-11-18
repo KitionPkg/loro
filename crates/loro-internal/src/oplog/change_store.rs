@@ -554,6 +554,19 @@ impl ChangeStore {
         self.arena.rollback(arena);
     }
 
+    /// Drops the parsed changes of every block that keeps its bytes; the next read parses it
+    /// again. A checkout across a long history (an undo of an old change) parses every block
+    /// of it, which holds many times the history's bytes.
+    pub(crate) fn release_parsed_blocks(&self) {
+        let mut inner = self.inner.lock();
+        for block in inner.mem_parsed_kv.values_mut() {
+            if let ChangesBlockContent::Both(_, bytes) = &block.content {
+                let bytes = bytes.clone();
+                Arc::make_mut(block).content = ChangesBlockContent::Bytes(bytes);
+            }
+        }
+    }
+
     /// Rolls the arena back to `arena` after the op log replaced this store (a failed
     /// snapshot import), and stops loading from it. A creator resolver that reached this store
     /// before the replacement then finds nothing instead of registering containers of the
@@ -575,16 +588,31 @@ impl ChangeStore {
         Some(block.content.iter_dag_nodes())
     }
 
+    /// Visits every change. A block held as bytes is parsed for the visit only: keeping each
+    /// block of a large history parsed holds many times its bytes (hundreds of megabytes for a
+    /// history of millions of operations), for a scan that reads each change once.
     pub fn visit_all_changes(&self, f: &mut dyn FnMut(&Change)) {
         self.ensure_block_loaded_in_range(Bound::Unbounded, Bound::Unbounded);
-        let mut inner = self.inner.lock();
-        for (id, block) in inner.mem_parsed_kv.iter_mut() {
-            if let Err(err) = block.ensure_changes(&self.arena) {
-                warn!(block_id = ?id, ?err, "failed to parse change block");
-                self.parse_failures.record(*id, &err);
-                continue;
-            }
-            for c in block.content.try_changes().unwrap() {
+        let inner = self.inner.lock();
+        for (id, block) in inner.mem_parsed_kv.iter() {
+            let parsed;
+            let changes = match &block.content {
+                ChangesBlockContent::Changes(changes) | ChangesBlockContent::Both(changes, _) => {
+                    changes.as_slice()
+                }
+                ChangesBlockContent::Bytes(bytes) => match bytes.parse(&self.arena) {
+                    Ok(changes) => {
+                        parsed = changes;
+                        parsed.as_slice()
+                    }
+                    Err(err) => {
+                        warn!(block_id = ?id, ?err, "failed to parse change block");
+                        self.parse_failures.record(*id, &err);
+                        continue;
+                    }
+                },
+            };
+            for c in changes {
                 f(c);
             }
         }
@@ -1244,6 +1272,55 @@ mod mut_inner_kv {
             let block = self.get_parsed_block(id)?;
             Some(BlockChangeRef {
                 change_index: block.get_change_index_by_counter(id.counter).unwrap(),
+                block: block.clone(),
+            })
+        }
+
+        /// [`Self::get_change`] without keeping the block it parses: `last` holds the block of
+        /// the previous call, which the next changes of a scan in order share. A block parsed
+        /// already is used as it is.
+        pub(crate) fn get_change_transient(
+            &self,
+            id: ID,
+            last: &mut Option<Arc<ChangesBlock>>,
+        ) -> Option<BlockChangeRef> {
+            let holds = |block: &ChangesBlock| {
+                block.peer == id.peer
+                    && block.counter_range.0 <= id.counter
+                    && id.counter < block.counter_range.1
+            };
+            if !last.as_deref().is_some_and(holds) {
+                self.ensure_block_loaded_in_range(Bound::Included(id), Bound::Included(id));
+                let found = {
+                    let inner = self.inner.lock();
+                    let (_, block) = inner.mem_parsed_kv.range(..=id).next_back()?;
+                    if !holds(block) {
+                        return None;
+                    }
+                    block.clone()
+                };
+                let block = match &found.content {
+                    ChangesBlockContent::Bytes(bytes) => match bytes.parse(&self.arena) {
+                        Ok(changes) => {
+                            let mut parsed = (*found).clone();
+                            parsed.content =
+                                ChangesBlockContent::Both(Arc::new(changes), bytes.clone());
+                            parsed.parsed_extent = self.arena.extent();
+                            Arc::new(parsed)
+                        }
+                        Err(err) => {
+                            warn!(block_id = ?found.id(), ?err, "failed to parse change block");
+                            self.parse_failures.record(found.id(), &err);
+                            return None;
+                        }
+                    },
+                    ChangesBlockContent::Changes(_) | ChangesBlockContent::Both(..) => found,
+                };
+                *last = Some(block);
+            }
+            let block = last.as_ref()?;
+            Some(BlockChangeRef {
+                change_index: block.get_change_index_by_counter(id.counter).ok()?,
                 block: block.clone(),
             })
         }

@@ -1257,6 +1257,14 @@ impl LoroDoc {
         self.doc.free_history_cache()
     }
 
+    /// Free the history cache, and the parsed form of the history the document read from bytes
+    /// (an imported snapshot's): a checkout across a long history, such as an undo of an old
+    /// change, parses all of it and keeps it parsed. Later checkouts parse what they read again.
+    #[inline]
+    pub fn release_parsed_history(&self) {
+        self.doc.release_parsed_history()
+    }
+
     /// Free the cached diff calculator that is used for checkout.
     #[inline]
     pub fn free_diff_calculator(&self) {

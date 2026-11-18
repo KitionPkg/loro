@@ -50,10 +50,17 @@ pub(crate) struct ContainerHistoryCache {
     shallow_maps_seeded: FxHashSet<ContainerIdx>,
 }
 
+/// The checkout index: every movable list's operations, and the operations of the maps a
+/// checkout read ([`ContainerHistoryCache::ensure_maps_indexed`]). A map is indexed the first
+/// time a diff reads it, from one scan of the history for all the maps a diff reads: indexing
+/// every map's operations of a large history (millions of cells written) at the first checkout
+/// held hundreds of megabytes for an undo that reads a few maps.
 #[derive(Debug, Default)]
 pub(crate) struct ForCheckout {
     pub(crate) map: MapHistoryCache,
     pub(crate) movable_list: MovableListHistoryCache,
+    /// The maps whose operations `map` holds, each in full.
+    maps: FxHashSet<ContainerIdx>,
 }
 
 #[derive(Clone, Copy)]
@@ -64,7 +71,8 @@ pub(crate) struct HasImportingCacheMark {
 impl HistoryCacheTrait for ForCheckout {
     fn insert(&mut self, op: &RichOp) {
         match op.raw_op().container.get_type() {
-            ContainerType::Map => self.map.insert(op),
+            ContainerType::Map if self.maps.contains(&op.raw_op().container) => self.map.insert(op),
+            ContainerType::Map => {}
             ContainerType::MovableList => self.movable_list.insert(op),
             _ => {}
         }
@@ -301,6 +309,45 @@ impl ContainerHistoryCache {
             .map(|group| match group {
                 HistoryCacheForImporting::Tree(tree) => tree,
             })
+    }
+
+    /// Indexes the operations of the maps of `containers` not indexed yet (see [`ForCheckout`]):
+    /// in the scan that builds the checkout index, else in one scan of the history for them.
+    pub(crate) fn ensure_maps_indexed(
+        &mut self,
+        containers: impl IntoIterator<Item = ContainerIdx>,
+    ) {
+        let wanted = containers
+            .into_iter()
+            .filter(|idx| idx.get_type() == ContainerType::Map);
+        if self.for_checkout.is_none() {
+            self.for_checkout = Some(ForCheckout {
+                maps: wanted.collect(),
+                ..Default::default()
+            });
+            let for_importing = self.for_importing.is_none();
+            if for_importing {
+                self.for_importing = Some(FxHashMap::default());
+            }
+            self.init_cache_by_visit_all_change_slow(true, for_importing);
+            return;
+        }
+        self.ensure_all_caches_exist();
+        let checkout = self.for_checkout.as_mut().unwrap();
+        let missing: FxHashSet<ContainerIdx> =
+            wanted.filter(|idx| !checkout.maps.contains(idx)).collect();
+        if missing.is_empty() {
+            return;
+        }
+        let map = &mut checkout.map;
+        self.change_store.visit_all_changes(&mut |c| {
+            for op in c.ops.iter() {
+                if missing.contains(&op.container) {
+                    map.insert(&RichOp::new_by_change(c, op));
+                }
+            }
+        });
+        checkout.maps.extend(missing);
     }
 
     pub(crate) fn has_cache(&self) -> bool {

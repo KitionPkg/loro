@@ -526,6 +526,13 @@ impl OpLog {
         history_cache.free();
     }
 
+    /// Frees the history cache and the parsed form of the history read from bytes (see
+    /// [`ChangeStore::release_parsed_blocks`]).
+    pub fn release_parsed_history(&self) {
+        self.free_history_cache();
+        self.change_store.release_parsed_blocks();
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn pending_changes_len(&self) -> usize {
@@ -825,6 +832,12 @@ impl OpLog {
         to: &VersionVector,
     ) -> Option<Vec<Frontiers>> {
         let mut uncovered = Vec::new();
+        // An entry change's parents are all in `from`: from the empty version only a change
+        // without parents is one, and the empty version covers it. Scanning would read (and
+        // parse) the whole history for nothing.
+        if from.is_empty() {
+            return Some(uncovered);
+        }
         for (peer, span) in from.diff(to).forward.iter() {
             let id_span = IdSpan::new(*peer, span.start, span.end);
             for change in self.change_store.iter_changes(id_span) {
@@ -1047,6 +1060,31 @@ impl OpLog {
                 ),
             > + '_,
     ) {
+        self.iter_from_replay_base_causally_with(from, from_frontiers, to, to_frontiers, true)
+    }
+
+    /// [`Self::iter_from_replay_base_causally`], which keeps parsed every block of the history
+    /// it reads (`keep_parsed`), or keeps none: a replay of one container's operations from the
+    /// empty version reads the whole history once, and keeping all of it parsed holds many times
+    /// its bytes.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn iter_from_replay_base_causally_with(
+        &self,
+        from: &VersionVector,
+        from_frontiers: &Frontiers,
+        to: &VersionVector,
+        to_frontiers: &Frontiers,
+        keep_parsed: bool,
+    ) -> (
+        ReplayBase,
+        impl Iterator<
+                Item = (
+                    BlockChangeRef,
+                    (Counter, Counter),
+                    Rc<RefCell<VersionVector>>,
+                ),
+            > + '_,
+    ) {
         let mut merged_vv = from.clone();
         merged_vv.merge(to);
         loro_common::debug!("to_frontiers={:?} vv={:?}", &to_frontiers, to);
@@ -1151,6 +1189,7 @@ impl OpLog {
         let mut node = iter.next();
         let mut cur_cnt = 0;
         let vv = Rc::new(RefCell::new(VersionVector::default()));
+        let mut last_block = None;
         (
             ReplayBase {
                 vv: replay_base_vv.clone(),
@@ -1173,7 +1212,13 @@ impl OpLog {
                         .max(replay_base_vv.get(&peer).copied().unwrap_or(0));
                     let dag_node_end = (inner.data.cnt + inner.data.len as Counter)
                         .min(merged_vv.get(&peer).copied().unwrap_or(0));
-                    let change = self.change_store.get_change(ID::new(peer, cnt)).unwrap();
+                    let change = if keep_parsed {
+                        self.change_store.get_change(ID::new(peer, cnt))
+                    } else {
+                        self.change_store
+                            .get_change_transient(ID::new(peer, cnt), &mut last_block)
+                    }
+                    .unwrap();
 
                     if change.ctr_end() < dag_node_end {
                         cur_cnt = change.ctr_end();
