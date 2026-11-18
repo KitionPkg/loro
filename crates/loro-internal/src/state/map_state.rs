@@ -34,6 +34,83 @@ fn translate_with_parent(
     }
 }
 
+/// `a.cmp(b)`, eight bytes at a time: map keys are often ids sharing a long prefix.
+pub(crate) fn compare_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let shared = a.len().min(b.len());
+    let mut at = 0;
+    while at + 8 <= shared {
+        let (x, y) = (
+            u64::from_be_bytes(a[at..at + 8].try_into().unwrap()),
+            u64::from_be_bytes(b[at..at + 8].try_into().unwrap()),
+        );
+        if x != y {
+            return x.cmp(&y);
+        }
+        at += 8;
+    }
+    a[at..].cmp(&b[at..])
+}
+
+/// Sorts `entries` by key, stably. Each key is first compared by the eight bytes that follow
+/// the prefix every key shares, as one number, and only when those are equal byte by byte: the
+/// keys of a map are often ids made at about the same time, which share a long prefix.
+pub(crate) fn sort_by_key_stably<T>(entries: &mut Vec<(InternalString, T)>) {
+    if entries.len() < 2 {
+        return;
+    }
+    let first = entries[0].0.as_bytes();
+    let mut shared = first.len();
+    for (key, _) in &entries[1..] {
+        let key = key.as_bytes();
+        shared = first[..shared.min(key.len())]
+            .iter()
+            .zip(key)
+            .take_while(|(a, b)| a == b)
+            .count();
+        if shared == 0 {
+            break;
+        }
+    }
+    let lead = |key: &[u8]| {
+        let rest = key.get(shared..).unwrap_or_default();
+        let mut bytes = [0_u8; 8];
+        let len = rest.len().min(8);
+        bytes[..len].copy_from_slice(&rest[..len]);
+        u64::from_be_bytes(bytes)
+    };
+    let mut order: Vec<(u64, usize)> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, (key, _))| (lead(key.as_bytes()), index))
+        .collect();
+    // Equal leads are ordered by the rest of the key (bytes past the end of a shorter key read
+    // as zero in the lead, so a lead never orders two keys against their bytes), and equal
+    // keys by where they were: the order is total, so an unstable sort is a stable one.
+    order.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| {
+                compare_keys(
+                    &entries[a.1].0.as_bytes()[shared..],
+                    &entries[b.1].0.as_bytes()[shared..],
+                )
+            })
+            .then(a.1.cmp(&b.1))
+    });
+    if order
+        .iter()
+        .enumerate()
+        .all(|(at, (_, index))| at == *index)
+    {
+        return;
+    }
+    let mut slots: Vec<Option<(InternalString, T)>> = entries.drain(..).map(Some).collect();
+    entries.extend(
+        order
+            .into_iter()
+            .filter_map(|(_, index)| slots[index].take()),
+    );
+}
+
 #[derive(Debug, Clone)]
 enum MapEntries {
     SortedTiny(SmallVec<[(InternalString, MapValue); 1]>),
@@ -396,6 +473,38 @@ impl MapState {
         }
     }
 
+    /// A map holding `entries`, sorted by key; of entries with one key the last is kept, as
+    /// inserting them one after another keeps it. Builds the entries at once instead of
+    /// inserting them one by one.
+    fn from_sorted_entries(idx: ContainerIdx, entries: Vec<(InternalString, MapValue)>) -> Self {
+        debug_assert!(entries.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        let mut ans = Self::new(idx);
+        let distinct = entries.len()
+            - entries
+                .windows(2)
+                .filter(|pair| pair[0].0 == pair[1].0)
+                .count();
+        if distinct <= TINY_MAP_MAX {
+            for (key, value) in entries {
+                ans.insert(key, value);
+            }
+            return ans;
+        }
+        let map: BTreeMap<InternalString, MapValue> = entries.into_iter().collect();
+        for (key, value) in &map {
+            match &value.value {
+                Some(LoroValue::Container(id)) => {
+                    ans.child_containers.insert(id.clone(), key.clone());
+                    ans.size += 1;
+                }
+                Some(_) => ans.size += 1,
+                None => {}
+            }
+        }
+        ans.map = MapEntries::Tree(map);
+        ans
+    }
+
     pub fn insert(&mut self, key: InternalString, value: MapValue) -> Option<MapValue> {
         let value_yes = value.value.is_some();
         let new_child = match &value.value {
@@ -481,8 +590,6 @@ impl MapState {
 
 mod snapshot {
 
-    use std::collections::BTreeMap;
-
     use loro_common::{InternalString, LoroValue};
     use rustc_hash::FxHashMap;
     use serde_columnar::Itertools;
@@ -562,17 +669,13 @@ mod snapshot {
     }
 
     impl MapState {
-        /// The state of a map whose value (`ordered`, from `decode_value_as_btree_map`) is
-        /// decoded already: the value's entries are moved into the state, in their order.
-        pub(crate) fn decode_snapshot_from_ordered(
+        /// The state of a map whose value (`entries`, from `decode_value_entries`) is decoded
+        /// already: the value's entries are moved into the state, in their order.
+        pub(crate) fn decode_snapshot_from_entries(
             idx: crate::container::idx::ContainerIdx,
-            ordered: BTreeMap<String, LoroValue>,
+            entries: Vec<(InternalString, LoroValue)>,
             bytes: &[u8],
         ) -> loro_common::LoroResult<Self> {
-            let entries = ordered
-                .into_iter()
-                .map(|(key, value)| (InternalString::from(key.as_str()), value))
-                .collect();
             Self::decode_snapshot_entries(idx, entries, bytes)
         }
 
@@ -599,7 +702,7 @@ mod snapshot {
             let peers = decode_peer_table(&mut bytes, "Decode map state failed")?;
 
             // Every key in order, merging the keys with a value and those without.
-            let mut ans = MapState::new(idx);
+            let mut merged = Vec::with_capacity(entries.len() + keys_with_none_value.len());
             let mut values = entries.into_iter().peekable();
             let mut deleted = keys_with_none_value.into_iter().peekable();
             loop {
@@ -623,7 +726,7 @@ mod snapshot {
                             state_decode_error("Decode map state failed: lamport overflow")
                         })?;
                 let peer = decode_peer_from_table(&peers, peer_idx, "Decode map state failed")?;
-                ans.insert(key, MapValue { value, lamp, peer });
+                merged.push((key, MapValue { value, lamp, peer }));
             }
 
             if !bytes.is_empty() {
@@ -632,26 +735,97 @@ mod snapshot {
                 ));
             }
 
-            Ok(ans)
+            Ok(MapState::from_sorted_entries(idx, merged))
         }
     }
 
     impl MapState {
-        pub(crate) fn decode_value_as_btree_map(
+        /// A map's value as its entries sorted by key, each key once: of entries with one key
+        /// the last is kept, as a `BTreeMap<String, LoroValue>` reading the same bytes keeps
+        /// it. Keys are interned as they are read, without an owned copy of each first.
+        pub(crate) fn decode_value_entries(
             bytes: &[u8],
-        ) -> loro_common::LoroResult<(BTreeMap<String, LoroValue>, &[u8])> {
-            let (value, bytes) = postcard::take_from_bytes::<BTreeMap<String, LoroValue>>(bytes)
-                .map_err(|_| {
+        ) -> loro_common::LoroResult<(MapValueEntries, &[u8])> {
+            let (MapEntriesInOrder(mut entries), bytes) =
+                postcard::take_from_bytes::<MapEntriesInOrder>(bytes).map_err(|_| {
                     loro_common::LoroError::DecodeError(
                         "Decode map value failed".to_string().into_boxed_str(),
                     )
                 })?;
-            Ok((value, bytes))
+            // Stable, so of equal keys the last read stays last.
+            super::sort_by_key_stably(&mut entries);
+            if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                let mut unique: Vec<(InternalString, LoroValue)> =
+                    Vec::with_capacity(entries.len());
+                for entry in entries {
+                    match unique.last_mut() {
+                        Some(last) if last.0 == entry.0 => *last = entry,
+                        _ => unique.push(entry),
+                    }
+                }
+                entries = unique;
+            }
+            Ok((entries, bytes))
+        }
+    }
+
+    /// A map's entries with a value, sorted by key.
+    pub(crate) type MapValueEntries = Vec<(InternalString, LoroValue)>;
+
+    /// A map key, interned from the bytes it is read from.
+    struct InternedKey(InternalString);
+
+    impl<'de> serde::Deserialize<'de> for InternedKey {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Key;
+            impl serde::de::Visitor<'_> for Key {
+                type Value = InternedKey;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a string")
+                }
+
+                fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<InternedKey, E> {
+                    Ok(InternedKey(key.into()))
+                }
+            }
+            deserializer.deserialize_str(Key)
+        }
+    }
+
+    /// A map's encoded entries in the order they are encoded: the same bytes a
+    /// `BTreeMap<String, LoroValue>` reads, without inserting each entry into a tree.
+    struct MapEntriesInOrder(Vec<(InternalString, LoroValue)>);
+
+    impl<'de> serde::Deserialize<'de> for MapEntriesInOrder {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Entries;
+            impl<'de> serde::de::Visitor<'de> for Entries {
+                type Value = MapEntriesInOrder;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a map")
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0).min(4096));
+                    while let Some((InternedKey(key), value)) = map.next_entry()? {
+                        entries.push((key, value));
+                    }
+                    Ok(MapEntriesInOrder(entries))
+                }
+            }
+            deserializer.deserialize_map(Entries)
         }
     }
 
     #[cfg(test)]
     mod map_snapshot_test {
+        use std::collections::BTreeMap;
+
         use loro_common::LoroValue;
 
         use crate::container::idx::ContainerIdx;
@@ -763,8 +937,8 @@ mod snapshot {
             };
             let (value, rest) = MapState::decode_value(&bytes).unwrap();
             let from_value = MapState::decode_snapshot_fast(idx, (value, rest), ctx).unwrap();
-            let (ordered, rest) = MapState::decode_value_as_btree_map(&bytes).unwrap();
-            let from_ordered = MapState::decode_snapshot_from_ordered(idx, ordered, rest).unwrap();
+            let (ordered, rest) = MapState::decode_value_entries(&bytes).unwrap();
+            let from_ordered = MapState::decode_snapshot_from_entries(idx, ordered, rest).unwrap();
             let entries = |state: &MapState| {
                 state
                     .map
@@ -779,6 +953,177 @@ mod snapshot {
                 from_ordered.get_child_index(&child),
                 Some(Index::Key("c".into()))
             );
+        }
+
+        /// A map of any size decodes to the state it was encoded from, through both read paths,
+        /// and the entries built at once equal those inserted one by one, repeated keys included.
+        #[test]
+        fn map_states_built_at_once_equal_states_built_by_inserts() {
+            use crate::event::Index;
+            use loro_common::{ContainerID, ContainerType};
+
+            let idx = ContainerIdx::from_index_and_type(0, loro_common::ContainerType::Map);
+            let ctx = ContainerCreationContext {
+                configure: &Default::default(),
+                peer: 0,
+            };
+            let entries = |state: &MapState| {
+                state
+                    .map
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Vec<_>>()
+            };
+            for len in 0..14_u32 {
+                let mut map = MapState::new(idx);
+                let mut children = Vec::new();
+                for index in 0..len {
+                    let key = format!("018f2a7c-0000-7000-8000-{:012}", (index * 7919) % 1000);
+                    let value = match index % 4 {
+                        0 => None,
+                        1 => {
+                            let child = ContainerID::new_normal(
+                                loro_common::ID::new(9, index as i32),
+                                ContainerType::Map,
+                            );
+                            children.push((child.clone(), key.clone()));
+                            Some(LoroValue::Container(child))
+                        }
+                        2 => Some(LoroValue::String(format!("row {index}").into())),
+                        _ => Some(LoroValue::I64(index as i64)),
+                    };
+                    map.insert(
+                        key.as_str().into(),
+                        MapValue {
+                            value,
+                            lamp: index * 3,
+                            peer: u64::from(index % 3),
+                        },
+                    );
+                }
+                let mut bytes = Vec::new();
+                map.encode_snapshot_fast(&mut bytes);
+                let (ordered, rest) = MapState::decode_value_entries(&bytes).unwrap();
+                let (inserted, inserted_rest) =
+                    postcard::take_from_bytes::<BTreeMap<String, LoroValue>>(&bytes).unwrap();
+                let as_strings: Vec<(String, LoroValue)> = ordered
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.clone()))
+                    .collect();
+                assert_eq!(as_strings, inserted.into_iter().collect::<Vec<_>>());
+                assert_eq!(rest, inserted_rest);
+                let from_ordered =
+                    MapState::decode_snapshot_from_entries(idx, ordered, rest).unwrap();
+                let (value, rest) = MapState::decode_value(&bytes).unwrap();
+                let from_value = MapState::decode_snapshot_fast(idx, (value, rest), ctx).unwrap();
+                for state in [&from_ordered, &from_value] {
+                    assert_eq!(entries(state), entries(&map), "{len} keys");
+                    assert_eq!(state.size, map.size);
+                    for (child, key) in &children {
+                        assert_eq!(
+                            state.get_child_index(child),
+                            Some(Index::Key(key.as_str().into()))
+                        );
+                    }
+                }
+            }
+
+            // Repeated keys: the last of each is kept, as inserting keeps it.
+            for len in [3_usize, 6, 9, 14] {
+                let child = |index: usize| {
+                    ContainerID::new_normal(
+                        loro_common::ID::new(4, index as i32),
+                        ContainerType::Text,
+                    )
+                };
+                let mut sorted = Vec::new();
+                for index in 0..len {
+                    let key: InternalString = format!("key-{:02}", index / 2).as_str().into();
+                    let value = match index % 3 {
+                        0 => Some(LoroValue::Container(child(index))),
+                        1 => None,
+                        _ => Some(LoroValue::I64(index as i64)),
+                    };
+                    sorted.push((
+                        key,
+                        MapValue {
+                            value,
+                            lamp: index as u32,
+                            peer: 1,
+                        },
+                    ));
+                }
+                let mut inserted = MapState::new(idx);
+                for (key, value) in sorted.clone() {
+                    inserted.insert(key, value);
+                }
+                let built = MapState::from_sorted_entries(idx, sorted);
+                assert_eq!(entries(&built), entries(&inserted), "{len} entries");
+                assert_eq!(built.size, inserted.size);
+                for index in 0..len {
+                    assert_eq!(
+                        built.get_child_index(&child(index)),
+                        inserted.get_child_index(&child(index))
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn entries_sort_by_key_stably() {
+            let keys = [
+                "018f2a7c-0000-7000-8000-000000000010",
+                "018f2a7c-0000-7000-8000-00000000001",
+                "018f2a7c-0000-7000-8000-000000000001",
+                "018f2a7c-0000-7000-8000-000000000001",
+                "018f2a7c-0000-7000-8000-00000000000",
+                "018f2a7c-0000-7000-8000-0000000000010",
+                "018f2a7c-0000-7000-8000-00000000000\u{0}",
+                "018f2a7c",
+                "018f2a7c-0000-7000-8000-000000000001",
+            ];
+            for rotate in 0..keys.len() {
+                let mut entries: Vec<(InternalString, usize)> = keys
+                    .iter()
+                    .cycle()
+                    .skip(rotate)
+                    .take(keys.len())
+                    .enumerate()
+                    .map(|(index, key)| ((*key).into(), index))
+                    .collect();
+                let mut expected = entries.clone();
+                expected.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                super::super::sort_by_key_stably(&mut entries);
+                assert_eq!(entries, expected);
+            }
+            let mut few: Vec<(InternalString, usize)> = vec![("b".into(), 0), ("a".into(), 1)];
+            super::super::sort_by_key_stably(&mut few);
+            assert_eq!(few, vec![("a".into(), 1), ("b".into(), 0)]);
+        }
+
+        #[test]
+        fn keys_compare_as_their_bytes_compare() {
+            let keys: Vec<&[u8]> = vec![
+                b"",
+                b"a",
+                b"ab",
+                b"abcdefgh",
+                b"abcdefgi",
+                b"abcdefgh0",
+                b"abcdefg",
+                b"018f2a7c-0000-7000-8000-000000000001",
+                b"018f2a7c-0000-7000-8000-000000000010",
+                b"018f2a7c-0000-7000-8000-00000000001",
+                b"018f2a7c-0000-7000-8000-000000000001\xff",
+                &[0xff; 9],
+                &[0x00; 9],
+                &[0x7f, 0x80, 0, 0, 0, 0, 0, 0, 1],
+            ];
+            for a in &keys {
+                for b in &keys {
+                    assert_eq!(super::super::compare_keys(a, b), a.cmp(b), "{a:?} {b:?}");
+                }
+            }
         }
 
         #[test]

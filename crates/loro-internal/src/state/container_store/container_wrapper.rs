@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use bytes::Bytes;
 use loro_common::{ContainerID, ContainerType, InternalString, LoroError, LoroResult, LoroValue};
 use once_cell::sync::OnceCell;
@@ -63,8 +61,9 @@ enum LazyDecodedValue {
         unicode_len: usize,
         utf16_len: usize,
     },
+    /// A map's entries sorted by key, each key once.
     Map {
-        ordered: BTreeMap<String, LoroValue>,
+        ordered: Vec<(InternalString, LoroValue)>,
         value: OnceCell<LoroValue>,
     },
 }
@@ -89,7 +88,7 @@ impl LazyDecodedValue {
                     LoroValue::Map(
                         ordered
                             .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .map(|(key, value)| (key.to_string(), value.clone()))
                             .collect::<loro_common::LoroMapValue>(),
                     )
                 })
@@ -104,18 +103,29 @@ impl LazyDecodedValue {
                 LoroValue::Map(
                     ordered
                         .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .map(|(key, value)| (key.to_string(), value.clone()))
                         .collect::<loro_common::LoroMapValue>(),
                 )
             }),
         }
     }
 
-    fn as_map(&self) -> Option<&BTreeMap<String, LoroValue>> {
+    fn as_map(&self) -> Option<&[(InternalString, LoroValue)]> {
         match self {
             Self::Map { ordered, .. } => Some(ordered),
             _ => None,
         }
+    }
+
+    /// The value of `key` in a map's entries.
+    fn map_entry(&self, key: &str) -> Option<&LoroValue> {
+        let ordered = self.as_map()?;
+        let at = ordered
+            .binary_search_by(|(entry, _)| {
+                super::super::map_state::compare_keys(entry.as_bytes(), key.as_bytes())
+            })
+            .ok()?;
+        Some(&ordered[at].1)
     }
 
     fn unicode_len(&self) -> Option<usize> {
@@ -292,7 +302,7 @@ impl ContainerWrapper {
             ContainerData::Lazy(_) => {
                 self.decode_value(idx, ctx).unwrap();
                 match &self.data {
-                    ContainerData::Lazy(lazy) => lazy.value.as_ref()?.as_map()?.get(key).cloned(),
+                    ContainerData::Lazy(lazy) => lazy.value.as_ref()?.map_entry(key).cloned(),
                     ContainerData::State(state) => state.as_map_state().unwrap().get(key).cloned(),
                 }
             }
@@ -309,7 +319,7 @@ impl ContainerWrapper {
                         .value
                         .as_ref()
                         .and_then(|value| value.as_map())
-                        .map_or(0, BTreeMap::len),
+                        .map_or(0, <[_]>::len),
                     ContainerData::State(state) => state.as_map_state().unwrap().len(),
                 }
             }
@@ -336,7 +346,7 @@ impl ContainerWrapper {
                         .value
                         .as_ref()
                         .and_then(|value| value.as_map())
-                        .map(|map| map.keys().map(|key| key.as_str().into()).collect())
+                        .map(|map| map.iter().map(|(key, _)| key.clone()).collect())
                         .unwrap_or_default(),
                     ContainerData::State(state) => state
                         .as_map_state()
@@ -371,7 +381,7 @@ impl ContainerWrapper {
                         .and_then(|value| value.as_map())
                         .map(|map| {
                             map.iter()
-                                .map(|(key, value)| (key.as_str().into(), value.clone()))
+                                .map(|(key, value)| (key.clone(), value.clone()))
                                 .collect()
                         })
                         .unwrap_or_default(),
@@ -695,7 +705,7 @@ impl ContainerWrapper {
                 )
             }
             ContainerType::Map => {
-                let (v, rest) = MapState::decode_value_as_btree_map(b)?;
+                let (v, rest) = MapState::decode_value_entries(b)?;
                 (
                     LazyDecodedValue::Map {
                         ordered: v,
@@ -776,7 +786,7 @@ impl ContainerWrapper {
             let Some(LazyDecodedValue::Map { ordered, .. }) = lazy.value.take() else {
                 unreachable!();
             };
-            let state = MapState::decode_snapshot_from_ordered(idx, ordered, b)?;
+            let state = MapState::decode_snapshot_from_entries(idx, ordered, b)?;
             self.data = ContainerData::State(state.into());
             return Ok(());
         }
